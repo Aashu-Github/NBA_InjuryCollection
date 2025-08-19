@@ -1,0 +1,127 @@
+# === Robust NBA Injury Analyzer (Colab) ===
+# Handles column name variations and writes one Excel with multiple sheets.
+
+import os, glob, re
+import pandas as pd
+from google.colab import files
+
+# ----- 0) Auto-detect file -----
+FILENAME = ""
+if not FILENAME:
+    csvs = sorted(glob.glob("*.csv"))
+    if not csvs:
+        raise SystemExit("No CSV found. Upload via left Files pane.")
+    if len(csvs) > 1:
+        print("Multiple CSVs found:", csvs)
+        raise SystemExit("Set FILENAME = 'your_file.csv' above and rerun.")
+    FILENAME = csvs[0]
+print("Using CSV file:", FILENAME)
+
+# ----- 1) Load -----
+df = pd.read_csv(FILENAME)
+
+# Normalize column names
+df.columns = [c.strip().lower() for c in df.columns]
+
+# Map flexible column names
+colmap = {}
+for want in ["player", "status", "reason", "date"]:
+    matches = [c for c in df.columns if want in c]
+    if not matches:
+        raise SystemExit(f"Could not find a column for '{want}' in {df.columns}")
+    colmap[want] = matches[0]
+
+# Rename for consistency
+df = df.rename(columns={
+    colmap["player"]: "PLAYER",
+    colmap["status"]: "STATUS",
+    colmap["reason"]: "REASON",
+    colmap["date"]: "DATE"
+})
+
+# Parse dates
+df["DATE_parsed"] = pd.to_datetime(df["DATE"], errors="coerce")
+
+# ----- 2) Categorization -----
+rx_surgery = re.compile(r'\b(surger(y|ies|ical|ically)?)\b|arthroscop(y|ic)\b|procedure\b|repair(ed|)\b', re.I)
+rx_noncontact = re.compile(r'\b(stress\s*fracture|sprain(ed)?|strain(ed)?|tear|torn)\b', re.I)
+rx_illness = re.compile(r'\b(illness|flu|viral|respiratory|covid|infection|fever|migraine)\b', re.I)
+rx_fracture_plain = re.compile(r'\bfracture(d)?\b', re.I)
+
+def categorize_reason(reason: str) -> str:
+    if pd.isna(reason): return "Other"
+    text = str(reason)
+    if rx_surgery.search(text): return "Surgery"
+    if rx_noncontact.search(text): return "Non-contact"
+    if rx_illness.search(text): return "Illness"
+    if rx_fracture_plain.search(text): return "Fracture"
+    return "Other"
+
+def extract_injury_type(reason: str) -> str:
+    if pd.isna(reason): return "Other"
+    text = str(reason).lower()
+    if re.search(r'surger', text): return "Surgery"
+    if re.search(r'stress\s*fracture', text): return "Stress Fracture"
+    if re.search(r'sprain', text): return "Sprain"
+    if re.search(r'strain', text): return "Strain"
+    if re.search(r'tear|torn', text): return "Tear"
+    if re.search(r'fracture', text): return "Fracture"
+    if re.search(r'illness|flu|viral|respiratory|covid|infection|fever|migraine', text): return "Illness"
+    return "Other"
+
+df["Group"] = df["REASON"].apply(categorize_reason)
+df["InjuryType"] = df["REASON"].apply(extract_injury_type)
+df["IsSurgery"] = df["Group"].eq("Surgery")
+
+# ----- 3) Episodes (merge <= 7 days apart) -----
+epi_df = df.dropna(subset=["DATE_parsed"]).copy()
+epi_df.sort_values(["PLAYER", "InjuryType", "DATE_parsed"], inplace=True)
+
+def assign_episode_ids(group, max_gap_days=7):
+    dates = group["DATE_parsed"].to_numpy()
+    episode_ids = [0]
+    for i in range(1, len(dates)):
+        gap = (dates[i] - dates[i-1]).astype("timedelta64[D]").astype(int)
+        episode_ids.append(episode_ids[-1] + 1 if gap > max_gap_days else episode_ids[-1])
+    group = group.copy()
+    group["episode_id"] = episode_ids
+    return group
+
+epi_df = epi_df.groupby(["PLAYER", "InjuryType"], group_keys=False).apply(assign_episode_ids)
+
+episodes = (
+    epi_df.groupby(["PLAYER", "InjuryType", "episode_id"])
+    .agg(
+        start_date=("DATE_parsed", "min"),
+        end_date=("DATE_parsed", "max"),
+        occurrences=("DATE_parsed", "size"),
+        example_reason=("REASON", "first"),
+        group_major=("Group", lambda s: s.mode().iat[0]),
+        is_surgery_any=("IsSurgery", "any"),
+    )
+    .reset_index()
+)
+episodes["sidelined_days"] = (episodes["end_date"] - episodes["start_date"]).dt.days
+episodes["sidelined_days_inclusive"] = episodes["sidelined_days"] + 1
+
+# ----- 4) Per-player summary -----
+per_player_episode_summary = (
+    episodes.groupby("PLAYER")
+    .agg(
+        episodes_count=("episode_id", "nunique"),
+        total_sidelined_days=("sidelined_days", "sum"),
+        total_sidelined_days_inclusive=("sidelined_days_inclusive", "sum"),
+    )
+    .reset_index()
+)
+
+# ----- 5) Write Excel (openpyxl) -----
+out_xlsx = "injury_analysis.xlsx"
+with pd.ExcelWriter(out_xlsx, engine="openpyxl") as writer:
+    df.to_excel(writer, sheet_name="Raw+Labels", index=False)
+    episodes.to_excel(writer, sheet_name="Episodes", index=False)
+    per_player_episode_summary.to_excel(writer, sheet_name="PlayerSummary", index=False)
+
+files.download(out_xlsx)
+
+print("✅ Done. Wrote", out_xlsx)
